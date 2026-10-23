@@ -28,7 +28,7 @@ import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 # ======================= 可改的设置 =======================
 CATALOG_INTERVAL_MIN = 2       # 目录检测间隔（分钟），免费
@@ -38,6 +38,7 @@ PROBE_WORKERS = 3              # 同时实测几个模型
 PROBE_ON_START = True          # 启动时是否立刻实测一次
 PROBE_TIMEOUT_SEC = 120        # 单个模型实测超时
 CATALOG_TIMEOUT_SEC = 60       # 目录检测超时
+CAT_SIZE = 44                  # 小猫模式的大小（像素）
 IDLE_ALPHA = 0.35              # 鼠标不在窗口上时的透明度（隐身程度，越小越透明）
 ACTIVE_ALPHA = 0.96            # 鼠标悬停时的透明度
 CODEX_PATH = ""                # 留空自动查找；也可在右键菜单里手动选择
@@ -253,22 +254,46 @@ def check_catalog():
 
 # ----------------------- 实测单个模型 -----------------------
 
+def error_message(text):
+    """从 codex --json 输出里取出真正的错误信息（turn.failed / error 事件）。"""
+    msgs = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if "fail" in str(ev.get("type", "")) or "error" in str(ev.get("type", "")):
+            e = ev.get("error") if isinstance(ev.get("error"), dict) else ev
+            m = e.get("message") or ev.get("message")
+            if isinstance(m, str):
+                inner = parse_json_loose(m)          # message 里有时又包了一层 JSON
+                if isinstance(inner, dict):
+                    m = (inner.get("error") or {}).get("message") or inner.get("detail") or m
+                msgs.append(str(m))
+    return msgs[-1] if msgs else ""
+
+
 def short_reason(text):
-    t = (text or "").lower()
+    msg = error_message(text)
+    t = (msg + "\n" + (text or "")).lower()
     table = [
         (("找不到 codex",), "找不到 codex（右键 → 选择 codex 位置）"),
         (("not logged in", "login", "unauthorized", "401"), "未登录/登录失效"),
         (("usage limit", "rate limit", "429", "quota"), "额度/限流"),
-        (("not supported", "does not exist", "not found", "unknown model",
-          "model_not_found", "invalid model", "404"), "账号不可用该模型"),
+        (("capacity", "overloaded", "503", "try again later"), "模型繁忙"),
+        (("not supported", "does not exist", "not found", "unknown model", "not available",
+          "model_not_found", "invalid model", "404", "selected model"), "账号不可用该模型"),
         (("timeout",), "超时"),
         (("network", "connect", "dns", "ssl", "tls"), "网络问题"),
     ]
     for keys, msg in table:
         if any(k in t for k in keys):
             return msg
-    line = next((l.strip() for l in (text or "").splitlines()[::-1] if l.strip()), "")
-    return line[:60]
+    line = msg or next((l.strip() for l in (text or "").splitlines()[::-1] if l.strip()), "")
+    return line[:40]
 
 
 def probe_model(model_id):
@@ -280,11 +305,12 @@ def probe_model(model_id):
     rc, out, err = run_codex(args, PROBE_TIMEOUT_SEC, cwd=tmp)
     secs = time.time() - t0
     shutil.rmtree(tmp, ignore_errors=True)
-    if rc == 0 and ("agent_message" in out or "OK" in out):
+    failed = '"turn.failed"' in out
+    if rc == 0 and "agent_message" in out and not failed:
         return "ok", f"{secs:.0f}s"
     reason = short_reason(err + "\n" + out) if rc != -9 else "超时"
-    log(f"probe {model_id} rc={rc}: {(err or out)[-800:]}")
-    level = "warn" if reason in ("额度/限流", "超时", "网络问题") else "fail"
+    log(f"probe {model_id} rc={rc}: {(err + out)[-800:]}")
+    level = "warn" if reason in ("额度/限流", "超时", "网络问题", "模型繁忙") else "fail"
     return level, reason or f"退出码 {rc}"
 
 
@@ -454,38 +480,51 @@ class App:
         r.configure(bg=C["bg"])
         r.geometry(self.state.get("pos", "+40+120"))
 
-        # 面板
+        # 面板（紧凑：标题行 + 每个模型一行"灯 + 名字"）
         self.panel = tk.Frame(r, bg=C["bg"])
         self.head = tk.Frame(self.panel, bg=C["head"])
         self.head.pack(fill="x")
-        self.mini_cat = tk.Canvas(self.head, width=26, height=26, bg=C["head"], highlightthickness=0)
-        self.mini_cat.pack(side="left", padx=(6, 0), pady=2)
-        self.title_lbl = tk.Label(self.head, text="Codex 模型", bg=C["head"], fg=C["fg"],
-                                  font=("Microsoft YaHei UI", 10, "bold"), padx=6, pady=4)
+        self.mini_cat = tk.Canvas(self.head, width=18, height=18, bg=C["head"], highlightthickness=0)
+        self.mini_cat.pack(side="left", padx=(4, 0), pady=1)
+        self.title_lbl = tk.Label(self.head, text="", bg=C["head"], fg=C["fg"],
+                                  font=("Segoe UI", 8, "bold"), padx=4)
         self.title_lbl.pack(side="left")
-        self.time_lbl = tk.Label(self.head, text="", bg=C["head"], fg=C["dim"],
-                                 font=("Microsoft YaHei UI", 8), padx=6)
-        self.time_lbl.pack(side="right")
-        self.body = tk.Frame(self.panel, bg=C["bg"], padx=8, pady=4)
+        self.btns = tk.Frame(self.head, bg=C["head"])
+        self.btn_widgets = []
+        for icon, tip, cmd in (("min", "缩成小猫", lambda: self.set_mode("cat")),
+                               ("eye", "隐身（Ctrl+Alt+M 或双击桌面图标唤回）", self.go_invisible),
+                               ("close", "关闭", self.quit)):
+            b = tk.Canvas(self.btns, width=16, height=16, bg=C["head"], highlightthickness=0, cursor="hand2")
+            b.pack(side="left", padx=1)
+            self.draw_icon(b, icon, C["dim"])
+            b.bind("<Button-1>", lambda e, c=cmd: c())
+            b.bind("<Enter>", lambda e, w=b, i=icon: self.draw_icon(w, i, C["fg"]))
+            b.bind("<Leave>", lambda e, w=b, i=icon: self.draw_icon(w, i, C["dim"]))
+            self.tooltip(b, lambda t=tip: t)
+            self.btn_widgets.append(b)
+        self.btns_shown = False
+        self.body = tk.Frame(self.panel, bg=C["bg"], padx=5, pady=2)
         self.body.pack(fill="both")
-        self.foot = tk.Label(self.panel, text="", bg=C["bg"], fg=C["dim"], anchor="w", justify="left",
-                             font=("Microsoft YaHei UI", 8), padx=8, pady=3, wraplength=270)
-        self.foot.pack(fill="x")
+        self.foot = tk.Label(self.panel, text="", bg=C["bg"], fg=C["new"], anchor="w", justify="left",
+                             font=("Microsoft YaHei UI", 7), padx=5, pady=1, wraplength=150)
         # 小猫
-        self.big_cat = tk.Canvas(r, width=72, height=72, bg=C["key"], highlightthickness=0)
+        self.big_cat = tk.Canvas(r, width=CAT_SIZE, height=CAT_SIZE, bg=C["key"], highlightthickness=0)
+        self.tip_win = None
 
-        for w in (self.head, self.mini_cat, self.title_lbl, self.time_lbl, self.big_cat):
+        for w in (self.head, self.mini_cat, self.title_lbl, self.big_cat):
             w.bind("<ButtonPress-1>", self._press)
             w.bind("<B1-Motion>", self._drag)
-        for w in (self.head, self.mini_cat, self.title_lbl, self.time_lbl):
+        for w in (self.head, self.mini_cat, self.title_lbl):
             w.bind("<ButtonRelease-1>", lambda e: self._save_pos())
             w.bind("<Double-Button-1>", lambda e: self.set_mode("cat"))
         self.big_cat.bind("<ButtonRelease-1>", self._cat_release)
-        for w in (r, self.head, self.mini_cat, self.title_lbl, self.time_lbl, self.body, self.foot, self.big_cat):
+        for w in (r, self.head, self.mini_cat, self.title_lbl, self.body, self.foot, self.big_cat):
             w.bind("<Button-3>", self.menu)
 
         self.set_mode(self.mode, save=False)
         threading.Thread(target=hotkey_thread, args=(self.q,), daemon=True).start()
+        if LOCK is not None:
+            threading.Thread(target=wake_listener, args=(LOCK, self.q), daemon=True).start()
         threading.Thread(target=self.check_update, args=(False,), daemon=True).start()
         r.after(300, self.tick)
         r.after(200, self.drain)
@@ -507,6 +546,12 @@ class App:
             rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
             inside = rx <= x < rx + self.root.winfo_width() and ry <= y < ry + self.root.winfo_height()
             self.set_alpha(ACTIVE_ALPHA if inside else IDLE_ALPHA)
+            if inside != self.btns_shown and self.mode == "panel":
+                self.btns_shown = inside
+                if inside:
+                    self.btns.pack(side="right")
+                else:
+                    self.btns.pack_forget()
         except Exception:
             pass
         self.root.after(250, self.hover_loop)
@@ -553,14 +598,66 @@ class App:
             save_state(self.state)
         self.render()
 
-    def toggle_hidden_window(self):
-        self.hidden = not self.hidden
+    def toggle_hidden_window(self, show=None):
+        self.hidden = (not self.hidden) if show is None else (not show)
+        self.hide_tip()
         if self.hidden:
             self.root.withdraw()
         else:
             self.root.deiconify()
             self.root.attributes("-topmost", True)
             self.root.lift()
+
+    def go_invisible(self):
+        """隐身：窗口消失；Ctrl+Alt+M 或双击桌面 Codex Models 图标唤回。"""
+        x, y = self.root.winfo_rootx(), self.root.winfo_rooty()
+        self.toggle_hidden_window(show=False)
+        if not self.state.get("hint_shown"):
+            self.state["hint_shown"] = True
+            save_state(self.state)
+            t = tk.Toplevel(self.root)
+            t.overrideredirect(True)
+            t.attributes("-topmost", True)
+            t.geometry(f"+{x}+{y}")
+            tk.Label(t, text="已隐身：按 Ctrl+Alt+M\n或双击桌面 Codex Models 唤回", bg=C["head"], fg=C["fg"],
+                     font=("Microsoft YaHei UI", 8), padx=8, pady=5, justify="left").pack()
+            t.after(3500, t.destroy)
+
+    @staticmethod
+    def draw_icon(cv, icon, color):
+        cv.delete("all")
+        if icon == "min":
+            cv.create_line(4, 11, 12, 11, fill=color, width=2)
+        elif icon == "eye":                         # 带斜杠的眼睛 = 隐身
+            cv.create_oval(2, 5, 14, 12, outline=color, width=1.5)
+            cv.create_oval(6, 6.5, 10, 10.5, fill=color, outline="")
+            cv.create_line(3, 14, 13, 3, fill=color, width=1.5)
+        else:
+            cv.create_line(4, 4, 12, 12, fill=color, width=2)
+            cv.create_line(12, 4, 4, 12, fill=color, width=2)
+
+    def tooltip(self, widget, text_fn):
+        widget.bind("<Enter>", lambda e: self.show_tip(e, text_fn()), add="+")
+        widget.bind("<Leave>", lambda e: self.hide_tip(), add="+")
+
+    def show_tip(self, e, text):
+        self.hide_tip()
+        if not text:
+            return
+        t = self.tip_win = tk.Toplevel(self.root)
+        t.overrideredirect(True)
+        t.attributes("-topmost", True)
+        t.geometry(f"+{e.x_root + 12}+{e.y_root + 10}")
+        tk.Label(t, text=text, bg="#111214", fg=C["fg"], font=("Microsoft YaHei UI", 8),
+                 padx=6, pady=3, justify="left").pack()
+
+    def hide_tip(self):
+        if self.tip_win is not None:
+            try:
+                self.tip_win.destroy()
+            except Exception:
+                pass
+            self.tip_win = None
 
     def menu(self, e):
         m = tk.Menu(self.root, tearoff=0)
@@ -569,7 +666,7 @@ class App:
         m.add_separator()
         m.add_command(label="展开面板" if self.mode == "cat" else "缩成小猫",
                       command=lambda: self.set_mode("panel" if self.mode == "cat" else "cat"))
-        m.add_command(label="完全隐藏（Ctrl+Alt+M 唤回）", command=self.toggle_hidden_window)
+        m.add_command(label="隐身（Ctrl+Alt+M 唤回）", command=self.go_invisible)
         m.add_checkbutton(label="显示隐藏模型", command=self.toggle_show_hidden,
                           variable=tk.BooleanVar(value=self.show_hidden))
         m.add_separator()
@@ -578,7 +675,7 @@ class App:
                       command=lambda: threading.Thread(target=self.check_update, args=(True,), daemon=True).start())
         m.add_command(label="打开日志", command=self.open_log)
         m.add_separator()
-        m.add_command(label="退出", command=self.quit)
+        m.add_command(label="关闭", command=self.quit)
         m.tk_popup(e.x_root, e.y_root)
 
     def open_log(self):
@@ -729,12 +826,16 @@ class App:
                     self.state["probe"] = self.probe
                     save_state(self.state)
                     if old == "ok" and level == "fail":
-                        self.changes = f"{mid} 变为不可用 ({time.strftime('%H:%M')})"
+                        self.set_change(f"{mid} 变为不可用 ({time.strftime('%H:%M')})")
                         self.alert()
                     elif old in ("fail", "warn") and level == "ok":
-                        self.changes = f"{mid} 恢复可用 ({time.strftime('%H:%M')})"
+                        self.set_change(f"{mid} 恢复可用 ({time.strftime('%H:%M')})")
                 elif kind == "hotkey":
                     self.toggle_hidden_window()
+                elif kind == "wake":
+                    self.toggle_hidden_window(show=True)
+                elif kind == "clear_changes":
+                    self.changes = ""
                 elif kind == "update_note":
                     self.update_note = data
                 elif kind == "restart":
@@ -759,7 +860,7 @@ class App:
                 parts.append("新增: " + ", ".join(added))
             if removed:
                 parts.append("消失: " + ", ".join(removed))
-            self.changes = "  ".join(parts) + time.strftime("  (%H:%M)")
+            self.set_change("  ".join(parts) + time.strftime("  (%H:%M)"))
             log("目录变化 " + self.changes)
             self.alert()
         self.models = cat["models"]
@@ -767,6 +868,10 @@ class App:
         self.status = f"来源：{cat['source']}" + (f"｜{cat['error']}" if cat["error"] else "")
         self.state.update(models=self.models, updated=self.updated)
         save_state(self.state)
+
+    def set_change(self, text):
+        self.changes = text
+        self.root.after(10 * 60 * 1000, lambda: self.q.put(("clear_changes", None)) if self.changes == text else None)
 
     def alert(self):
         try:
@@ -804,39 +909,48 @@ class App:
     def draw_cats(self):
         _, _, mood, badge, color = self.summary()
         if self.mode == "cat":
-            draw_cat(self.big_cat, 72, mood, self.blink, badge, color)
+            draw_cat(self.big_cat, CAT_SIZE, mood, self.blink, badge, color)
         else:
-            draw_cat(self.mini_cat, 26, mood, self.blink)
+            draw_cat(self.mini_cat, 18, mood, self.blink)
 
     def render(self):
         shown, n_ok, mood, badge, color = self.summary()
         self.draw_cats()
         if self.mode == "cat":
             return
+        self.hide_tip()
         for w in self.body.winfo_children():
             w.destroy()
-        self.title_lbl.config(text=f"Codex 模型  {len(shown)}个" + (f" · 可用{n_ok}" if n_ok else ""))
-        self.time_lbl.config(text=f"更新 {self.updated}" if self.updated else "")
+        self.title_lbl.config(text=f"{n_ok}/{len(shown)}" if any(m["id"] in self.probe for m in shown)
+                              else f"{len(shown)}")
         if not shown:
             tk.Label(self.body, text="暂无数据", bg=C["bg"], fg=C["dim"],
-                     font=("Microsoft YaHei UI", 9)).pack(anchor="w")
+                     font=("Microsoft YaHei UI", 8)).pack(anchor="w")
         for m in shown:
             pr = self.probe.get(m["id"])
             if pr is None:
-                dot, note = C["catalog"], "在目录中"
+                dot, note = C["catalog"], "在目录中，尚未实测"
             else:
                 dot = {"ok": C["ok"], "fail": C["fail"]}.get(pr[0], C["warn"])
-                note = ("可用 " if pr[0] == "ok" else "") + f"{pr[1]} @{pr[2]}"
+                note = ("可用，响应 " if pr[0] == "ok" else "") + f"{pr[1]}（{pr[2]} 测）"
             row = tk.Frame(self.body, bg=C["bg"])
-            row.pack(fill="x", pady=1)
-            tk.Label(row, text="●", fg=dot, bg=C["bg"], font=("Segoe UI", 10)).pack(side="left")
+            row.pack(fill="x")
+            lamp = tk.Canvas(row, width=10, height=10, bg=C["bg"], highlightthickness=0)
+            lamp.create_oval(1, 1, 9, 9, fill=dot, outline="")
+            lamp.pack(side="left", padx=(1, 0))
             tk.Label(row, text=m["id"], fg=C["dim"] if m.get("hidden") else C["fg"], bg=C["bg"],
-                     font=("Consolas", 10)).pack(side="left", padx=(4, 10))
-            tk.Label(row, text=note, fg=C["dim"], bg=C["bg"], font=("Microsoft YaHei UI", 8)).pack(side="right")
+                     font=("Consolas", 9)).pack(side="left", padx=(2, 4))
             for w in row.winfo_children() + [row]:
                 w.bind("<Button-3>", self.menu)
-        lines = [x for x in (self.changes, self.status, self.update_note) if x]
-        self.foot.config(text="\n".join(lines), fg=C["new"] if (self.changes or self.update_note) else C["dim"])
+                self.tooltip(w, lambda n=note: n)
+        important = ("⚠", "找不到", "未登录", "出错", "失败", "已是最新", "已设置")
+        msgs = [self.changes, self.update_note] + ([self.status] if any(k in self.status for k in important) else [])
+        msgs = [x for x in msgs if x]
+        if msgs:
+            self.foot.config(text="\n".join(msgs))
+            self.foot.pack(fill="x")
+        else:
+            self.foot.pack_forget()
 
     def run(self):
         self.root.mainloop()
@@ -855,6 +969,25 @@ def single_instance():
         return None
 
 
+def wake_listener(sock, q):
+    """另一个实例启动（比如双击桌面图标）时，把已隐身的窗口唤回来。"""
+    while True:
+        try:
+            c, _ = sock.accept()
+            c.close()
+            q.put(("wake", None))
+        except Exception:
+            return
+
+
+def wake_existing():
+    import socket
+    try:
+        socket.create_connection(("127.0.0.1", 47321), timeout=2).close()
+    except Exception:
+        pass
+
+
 LOCK = None
 
 if __name__ == "__main__":
@@ -863,6 +996,7 @@ if __name__ == "__main__":
         if LOCK is not None:
             break
         if "--wait" not in sys.argv:
+            wake_existing()
             sys.exit(0)
         time.sleep(0.5)
     try:
