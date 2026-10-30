@@ -28,7 +28,7 @@ import traceback
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # ======================= 可改的设置 =======================
 CATALOG_INTERVAL_MIN = 2       # 目录检测间隔（分钟），免费
@@ -43,6 +43,13 @@ IDLE_ALPHA = 0.35              # 鼠标不在窗口上时的透明度（隐身�
 ACTIVE_ALPHA = 0.96            # 鼠标悬停时的透明度
 CODEX_PATH = ""                # 留空自动查找；也可在右键菜单里手动选择
 SHOW_HIDDEN = False            # 是否默认显示目录里标记为隐藏的模型
+# ---- v1.3 准确度相关 ----
+PROBE_EFFORT = "auto"          # 实测用的推理强度：auto = 跟 config.toml 一致；也可填 low/medium/high/xhigh；"" = 不指定
+SLOW_PROBE_SEC = 60            # 实测超过这么多秒才回复，标为黄色"响应慢"（通常是在排队/重试）
+PASSIVE_WATCH = True           # 读取 Codex 会话日志，捕捉你实际使用时的"满载"报错（不耗额度）
+PASSIVE_SCAN_SEC = 20          # 多久扫一次会话日志（秒）
+PASSIVE_HOLD_MIN = 10          # 实际使用报满载后，该模型保持黄色多少分钟（期间实测通过也不变绿）
+STALE_MIN = 35                 # 实测结果超过多少分钟没更新，灯变灰（结果已过期，仅供参考）
 # =========================================================
 
 REPO_RAW = "https://raw.githubusercontent.com/guanbeimark-eng/codex-model-monitor/main/codex_model_monitor.pyw"
@@ -296,22 +303,181 @@ def short_reason(text):
     return line[:40]
 
 
-def probe_model(model_id):
-    """返回 ('ok'|'fail'|'warn', 说明)。"""
+EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+BUSY_KEYS = ("at capacity", "server_overloaded", "overloaded", "reconnecting", "retrying")
+
+
+def configured_effort():
+    """实测用的推理强度。auto = 读 config.toml 顶层的 model_reasoning_effort，和你平时用的一致。
+    （满载时高推理强度往往先被拒，用默认强度实测会"假绿"。）"""
+    e = (PROBE_EFFORT or "").strip().lower()
+    if e and e != "auto":
+        return e if e in EFFORTS else ""
+    if not e:
+        return ""
+    try:
+        with open(os.path.join(CODEX_HOME, "config.toml"), "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        return ""
+    top = re.split(r"^\s*\[", text, maxsplit=1, flags=re.M)[0]      # 只看顶层，不看 [profiles.x]
+    m = re.search(r'^\s*model_reasoning_effort\s*=\s*["\']?(\w+)', top, re.M)
+    v = m.group(1).lower() if m else ""
+    return v if v in EFFORTS else ""
+
+
+def _probe_once(model_id, effort):
     tmp = tempfile.mkdtemp(prefix="codex_probe_")
-    args = ["exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only",
-            "--json", "-C", tmp, "-m", model_id, "Reply with exactly: OK"]
+    args = ["exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "--json", "-C", tmp, "-m", model_id]
+    if effort:
+        args += ["-c", f'model_reasoning_effort="{effort}"']
+    args.append("Reply with exactly: OK")
     t0 = time.time()
     rc, out, err = run_codex(args, PROBE_TIMEOUT_SEC, cwd=tmp)
     secs = time.time() - t0
     shutil.rmtree(tmp, ignore_errors=True)
+    return rc, out, err, secs
+
+
+def classify_probe(rc, out, err, secs):
+    """根据 codex exec 的结果判断 ('ok'|'fail'|'warn', 说明)。单独拿出来方便测试。"""
     failed = '"turn.failed"' in out
     if rc == 0 and "agent_message" in out and not failed:
+        # 最终成功，但中途报过满载/重连 = codex 自动重试掩盖了繁忙，你实际用的时候很可能会撞上
+        if any(k in (out + "\n" + err).lower() for k in BUSY_KEYS):
+            return "warn", f"繁忙（重试后才通过，{secs:.0f}s）"
+        if SLOW_PROBE_SEC and secs > SLOW_PROBE_SEC:
+            return "warn", f"响应慢 {secs:.0f}s（可能在排队）"
         return "ok", f"{secs:.0f}s"
     reason = short_reason(err + "\n" + out) if rc != -9 else "超时"
-    log(f"probe {model_id} rc={rc}: {(err + out)[-800:]}")
     level = "warn" if reason in ("额度/限流", "超时", "网络问题", "模型繁忙") else "fail"
     return level, reason or f"退出码 {rc}"
+
+
+def probe_model(model_id):
+    """返回 ('ok'|'fail'|'warn', 说明)。用和平时一样的推理强度实测。"""
+    effort = configured_effort()
+    rc, out, err, secs = _probe_once(model_id, effort)
+    level, text = classify_probe(rc, out, err, secs)
+    if level == "fail" and effort and re.search(r"reasoning|effort|unsupported value", (out + err).lower()):
+        log(f"probe {model_id}: 推理强度 {effort} 不被支持，改用默认强度重测")
+        effort = ""
+        rc, out, err, secs = _probe_once(model_id, effort)
+        level, text = classify_probe(rc, out, err, secs)
+    if level != "ok":
+        log(f"probe {model_id} effort={effort or 'default'} rc={rc}: {(err + out)[-800:]}")
+    if effort and level == "ok":
+        text += f" @{effort}"
+    return level, text
+
+
+# ----------------------- 被动检测：读 Codex 会话日志 -----------------------
+# Codex（CLI / 桌面版 / VS Code 插件）把每个会话写到 ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl。
+# turn_context 里有实际使用的模型；满载时会出现 "Selected model is at capacity" / server_overloaded。
+# 你真实使用时撞到的报错比任何实测都准，所以用它来纠正实测结果。
+
+def _parse_ts(s):
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _all_text(obj, depth=0):
+    if depth > 8:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        return " ".join(_all_text(v, depth + 1) for v in obj.values())
+    if isinstance(obj, list):
+        return " ".join(_all_text(v, depth + 1) for v in obj)
+    return ""
+
+
+class SessionWatcher:
+    """增量读取最近的 rollout 文件，产出事件 (model, 'capacity'|'ok', 时间戳)。"""
+    FIRST_READ_MAX = 4 * 1024 * 1024        # 第一次打开大文件只读最后 4MB
+
+    def __init__(self, root=None):
+        self.root = root or os.path.join(CODEX_HOME, "sessions")
+        self.files = {}                      # path -> {"pos", "model", "turn_err"}
+
+    def recent_files(self, max_age_sec):
+        now = time.time()
+        out = []
+        for days_ago in (0, 1):              # 今天 + 昨天的目录（跨午夜）
+            d = time.localtime(now - days_ago * 86400)
+            folder = os.path.join(self.root, f"{d.tm_year:04d}", f"{d.tm_mon:02d}", f"{d.tm_mday:02d}")
+            try:
+                names = os.listdir(folder)
+            except Exception:
+                continue
+            for n in names:
+                if n.startswith("rollout-") and n.endswith(".jsonl"):
+                    p = os.path.join(folder, n)
+                    try:
+                        if now - os.path.getmtime(p) <= max_age_sec:
+                            out.append(p)
+                    except Exception:
+                        pass
+        return out
+
+    def scan(self, max_age_sec):
+        events = []
+        for p in self.recent_files(max_age_sec):
+            st = self.files.setdefault(p, {"pos": None, "model": None, "turn_err": False})
+            try:
+                size = os.path.getsize(p)
+                if st["pos"] is None:
+                    st["pos"] = max(0, size - self.FIRST_READ_MAX)
+                if size < st["pos"]:         # 文件被重写
+                    st["pos"] = 0
+                if size == st["pos"]:
+                    continue
+                with open(p, "rb") as f:
+                    f.seek(st["pos"])
+                    chunk = f.read()
+                end = chunk.rfind(b"\n")     # 只处理完整的行，半行留到下次
+                if end < 0:
+                    continue
+                st["pos"] += end + 1
+                for raw in chunk[:end].splitlines():
+                    events.extend(self._line(st, raw))
+            except Exception as e:
+                log(f"读取会话日志失败 {p}: {e}")
+        return events
+
+    @staticmethod
+    def _line(st, raw):
+        try:
+            rec = json.loads(raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return []
+        if not isinstance(rec, dict):
+            return []
+        typ = rec.get("type")
+        payload = rec.get("payload") if isinstance(rec.get("payload"), dict) else {}
+        ptype = str(payload.get("type", ""))
+        ts = _parse_ts(rec.get("timestamp")) or time.time()
+        if typ == "turn_context":
+            if isinstance(payload.get("model"), str):
+                st["model"] = payload["model"]
+            st["turn_err"] = False
+            return []
+        if ptype in ("task_started", "turn_started"):
+            st["turn_err"] = False
+            return []
+        # 只看错误类记录；聊天内容里提到 "at capacity" 不算
+        is_err = "error" in ptype or "fail" in ptype or "codex_error_info" in payload or typ == "error"
+        text = _all_text(payload).lower() if is_err else ""
+        if ("at capacity" in text or "server_overloaded" in text) and st["model"]:
+            st["turn_err"] = True
+            return [(st["model"], "capacity", ts)]
+        if ptype in ("task_complete", "turn_complete") and st["model"] and not st["turn_err"]:
+            return [(st["model"], "ok", ts)]
+        return []
 
 
 # ----------------------- 自动更新 -----------------------
@@ -381,7 +547,7 @@ def hotkey_thread(q):
 C = {
     "bg": "#1e1f22", "head": "#2b2d31", "fg": "#e6e6e6", "dim": "#8a8f98",
     "ok": "#3ddc84", "catalog": "#5aa9ff", "fail": "#ff5c5c", "warn": "#f5b942",
-    "new": "#ffd84d", "key": "#010203",
+    "new": "#ffd84d", "key": "#010203", "stale": "#6b6f78",
 }
 FUR, FUR_DARK, LINE, PINK, MUZZLE = "#f2a65a", "#d9853b", "#3a2a20", "#f7b6c2", "#fff4e6"
 
@@ -449,7 +615,10 @@ class App:
         self.state = load_state()
         USER_CODEX = self.state.get("codex_path", "")
         self.models = self.state.get("models", [])
-        self.probe = self.state.get("probe", {})              # id -> [level, text, ts]
+        self.probe = self.state.get("probe", {})              # id -> [level, text, "HH:MM", epoch]
+        self.passive = self.state.get("passive", {})          # id -> [level, text, "HH:MM", epoch]（真实使用）
+        self.watcher = SessionWatcher() if PASSIVE_WATCH else None
+        self.scanning = threading.Lock()
         self.show_hidden = self.state.get("show_hidden", SHOW_HIDDEN)
         self.mode = self.state.get("mode", "panel")           # panel / cat
         self.status = "启动中…"
@@ -745,12 +914,71 @@ class App:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--wait"], creationflags=NO_WINDOW)
         self.root.destroy()
 
+    # ---- 合并：实测 + 真实使用 ----
+    def effective(self, mid, now=None):
+        """返回 [level, 说明] 或 None。level: ok / warn / fail / stale。
+        规则：PASSIVE_HOLD_MIN 内真实使用报过满载 → 黄色，就算之后短实测通过也不变绿
+              （短请求能过、长任务被拒是常见情况）；真实使用正常且比实测新 → 绿；
+              实测结果太旧 → 灰。"""
+        now = now or time.time()
+        hold = PASSIVE_HOLD_MIN * 60
+        p, a = self.probe.get(mid), self.passive.get(mid)
+        p_ts = p[3] if p and len(p) > 3 else 0
+        a_fresh = a and len(a) > 3 and now - a[3] <= hold
+        if a_fresh and a[0] == "warn":
+            extra = f"；之后实测通过（{p[2]}）" if p and p[0] == "ok" and p_ts > a[3] else ""
+            return ["warn", f"实际使用报满载（{a[2]}）{extra}"]
+        if a_fresh and a[0] == "ok" and (not p or a[3] >= p_ts):
+            return ["ok", f"实际使用正常（{a[2]}）"]
+        if not p:
+            return None
+        if p_ts and STALE_MIN and now - p_ts > STALE_MIN * 60:
+            return ["stale", f"上次实测 {p[2]}：{p[1]}（已过期 {int((now - p_ts) / 60)} 分钟）"]
+        prefix = "可用，响应 " if p[0] == "ok" else ""
+        return [p[0], f"{prefix}{p[1]}（{p[2]} 测）"]
+
+    def passive_scan(self):
+        with self.scanning:
+            try:
+                ev = self.watcher.scan(max(PASSIVE_HOLD_MIN * 60, PASSIVE_SCAN_SEC * 3))
+                if ev:
+                    self.q.put(("passive", ev))
+            except Exception:
+                log(traceback.format_exc())
+
+    def on_passive(self, events):
+        now = time.time()
+        for mid, kind, ts in sorted(events, key=lambda e: e[2]):
+            if now - ts > PASSIVE_HOLD_MIN * 60:
+                continue                    # 太旧的报错不算
+            old = self.passive.get(mid)
+            if old and len(old) > 3 and old[3] > ts:
+                continue
+            before = (self.effective(mid) or [None])[0]
+            hm = time.strftime("%H:%M", time.localtime(ts))
+            if kind == "capacity":
+                self.passive[mid] = ["warn", "满载", hm, ts]
+                if before in ("ok", "stale", None):
+                    self.set_change(f"{mid} 实际使用报满载 ({hm})")
+                    self.alert()
+                log(f"会话日志：{mid} 报满载 {hm}")
+            else:
+                self.passive[mid] = ["ok", "正常", hm, ts]
+        self.state["passive"] = self.passive
+        save_state(self.state)
+
     # ---- 调度 ----
     def bad_models(self):
-        return [m["id"] for m in self.shown() if self.probe.get(m["id"], [""])[0] in ("fail", "warn")]
+        return [m["id"] for m in self.shown() if (self.effective(m["id"]) or [""])[0] in ("fail", "warn")]
 
     def tick(self):
         now = time.time()
+        if self.watcher and now >= getattr(self, "next_passive", 0) and not self.scanning.locked():
+            self.next_passive = now + PASSIVE_SCAN_SEC
+            threading.Thread(target=self.passive_scan, daemon=True).start()
+        if int(now // 60) != getattr(self, "_last_min", None) and self.tip_win is None:
+            self._last_min = int(now // 60)
+            self.render()                   # 每分钟重画一次，让过期的黄灯/灰灯按时变化
         if not self.busy.locked():
             if PROBE_INTERVAL_MIN > 0 and now >= self.next_probe:
                 self.start_job("all")
@@ -822,7 +1050,7 @@ class App:
                 elif kind == "probe":
                     mid, level, text = data
                     old = self.probe.get(mid, [None])[0]
-                    self.probe[mid] = [level, text, time.strftime("%H:%M")]
+                    self.probe[mid] = [level, text, time.strftime("%H:%M"), time.time()]
                     self.state["probe"] = self.probe
                     save_state(self.state)
                     if old == "ok" and level == "fail":
@@ -830,6 +1058,8 @@ class App:
                         self.alert()
                     elif old in ("fail", "warn") and level == "ok":
                         self.set_change(f"{mid} 恢复可用 ({time.strftime('%H:%M')})")
+                elif kind == "passive":
+                    self.on_passive(data)
                 elif kind == "hotkey":
                     self.toggle_hidden_window()
                 elif kind == "wake":
@@ -887,7 +1117,7 @@ class App:
 
     def summary(self):
         shown = self.shown()
-        levels = [self.probe.get(m["id"], [None])[0] for m in shown]
+        levels = [(self.effective(m["id"]) or [None])[0] for m in shown]
         n_ok = levels.count("ok")
         n_bad = sum(1 for l in levels if l in ("fail", "warn"))
         if self.working:
@@ -921,18 +1151,19 @@ class App:
         self.hide_tip()
         for w in self.body.winfo_children():
             w.destroy()
-        self.title_lbl.config(text=f"{n_ok}/{len(shown)}" if any(m["id"] in self.probe for m in shown)
+        self.title_lbl.config(text=f"{n_ok}/{len(shown)}"
+                              if any(m["id"] in self.probe or m["id"] in self.passive for m in shown)
                               else f"{len(shown)}")
         if not shown:
             tk.Label(self.body, text="暂无数据", bg=C["bg"], fg=C["dim"],
                      font=("Microsoft YaHei UI", 8)).pack(anchor="w")
         for m in shown:
-            pr = self.probe.get(m["id"])
-            if pr is None:
+            ef = self.effective(m["id"])
+            if ef is None:
                 dot, note = C["catalog"], "在目录中，尚未实测"
             else:
-                dot = {"ok": C["ok"], "fail": C["fail"]}.get(pr[0], C["warn"])
-                note = ("可用，响应 " if pr[0] == "ok" else "") + f"{pr[1]}（{pr[2]} 测）"
+                dot = {"ok": C["ok"], "fail": C["fail"], "stale": C["stale"]}.get(ef[0], C["warn"])
+                note = ef[1]
             row = tk.Frame(self.body, bg=C["bg"])
             row.pack(fill="x")
             lamp = tk.Canvas(row, width=10, height=10, bg=C["bg"], highlightthickness=0)
